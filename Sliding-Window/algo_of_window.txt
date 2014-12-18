@@ -1,0 +1,31 @@
+This is just for referenece when I forget.
+
+Window win
+WINDOWSIZE = 6
+// next: next pkt I'm going to send, base: the pkt that needs to be recv
+next = 0, base = 0
+send_iter = 0, recv_iter = 0, temp_iter = 0
+
+index : 0 | 1 | 2 | 3 | 4 | 5 |
+
+When sending a pkt:
+
+int index = next - (WINDOWSIZE * send_iter);
+if(next >= WINDOWSIZE*(send_iter+1)){ send_iter++; }
+
+// I'm going to place the value of the var by doing ":0"
+// here we placing a pkt in window 0
+ex. index:0 = next:0 - (WINDOWSIZE:6 * send_iter:0)
+
+now say next:6
+if(next:6 >= WINDOWSIZE:6 * (send_iter:0 + 1)){ send_iter:1 }
+
+now that next is 6 we are essentially going back to index 0
+ex. index:0 = next:6 - (WINDOWSIZE:6 * send_iter:1)
+
+so on and so forth we keep looping back to index:0 because 
+
+iteration is 0: index : 0 | 1 | 2 | 3 | 4 | 5 | 
+....
+iteration is n: index : 0 | 1 | 2 | 3 | 4 | 5 | 
+
