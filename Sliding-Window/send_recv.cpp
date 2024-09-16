@@ -1,24 +1,24 @@
 #include "send_recv.h"
 
+#include <vector>
+
 void syserr(const char* msg) { perror(msg); exit(-1); }
+static const int WINDOWSIZE = 100;
+static const int BUFFERSIZE = 1024;
 
 typedef struct pkt{
-	unsigned char buffer[1024];
+	unsigned char buffer[BUFFERSIZE];
 	timeval t;
 	unsigned int seq_no;
 	unsigned int file_rem;	
 	unsigned int chk_sum;
 }Packet;
 
-
-// Note: we can change this to be uint32_t and uint16_t to have normal chksum
-// But we like to keep it simple.
-unsigned int checksum(void *pkt, int size){
+unsigned int checksum(const unsigned char *pkt, int size){
 	unsigned int sum = 0;
-	unsigned char* temp_pkt = (unsigned char*)pkt;
 	
 	for(int i = 0; i < size; i++){
-		sum += temp_pkt[i];
+		sum += pkt[i];
 		sum = (sum>>8) + (sum&0xff);
 	}
 	return ~sum;
@@ -27,7 +27,7 @@ unsigned int checksum(void *pkt, int size){
 int sender(char *recv_ip, int recv_port, char* file_name){
 	
 	/* File + Sanity Chk */
-	int file_size, total_size;
+	long file_size, total_size;
 	FILE *fp = fopen(file_name, "rb");
 	if(fp == NULL){ perror("FP NULL: "); return -1; }
 	//Get file length
@@ -58,23 +58,21 @@ int sender(char *recv_ip, int recv_port, char* file_name){
 	
 	/* Prepare Select + GBN */
 	fd_set set;
-	unsigned int base = 0, next = 0, recv_iter = 0, send_iter = 0, acked = (unsigned int)ceil(file_size/1024 + .01) ;
+	unsigned int base = 0, next = 0, recv_iter = 0, send_iter = 0, acked = (unsigned int)ceil(file_size / BUFFERSIZE + .01) ;
+	int sel_result, amount_recv = 0;
 	double rtt = 0.0;
 	timeval timeout;
 	timeout.tv_sec = 0; timeout.tv_usec = 10000;
-	int sel_result, amo_recv = 0;
 	FD_ZERO(&set);				// reset flags
 	FD_SET(sockfd, &set);
 	
-	static const unsigned short int WINDOWSIZE = 100;
-	unsigned char** window = (unsigned char**)malloc(WINDOWSIZE * sizeof(Packet));
-	memset(window, 0, WINDOWSIZE*sizeof(Packet));	// clean the window
-	unsigned char buffer[1025];
+	std::vector<Packet> window;
+	unsigned char buffer[BUFFERSIZE];
 	/* Prepare Select + GBN */
 	
 	printf("***** Sending *****\n");
 	printf("Sending File: %s\n", file_name);
-	printf("File size %.2f Kb\n", (double)file_size/1024);
+	printf("File size %.2f Kb\n", (double)file_size / 1024);
 	
 	// We first send all the packets until size of window or if less send acked
 	// Small description: Make the pkt, save pkt in window, send pkt, increase next, 
@@ -84,130 +82,122 @@ int sender(char *recv_ip, int recv_port, char* file_name){
 		int index = next - (WINDOWSIZE * send_iter);	
 		timeval time;
 		
-		memset(buffer, 0, sizeof(buffer));
-		int amo_read = fread(buffer, sizeof(unsigned char), sizeof(buffer)-1, fp);
-		buffer[amo_read] = '\0';
+		memset(buffer, 0, BUFFERSIZE);
+		int amount_read = fread(buffer, sizeof(unsigned char), BUFFERSIZE, fp);
 		gettimeofday(&time, 0);
 		
-		Packet *value = (Packet*)malloc(sizeof(Packet));
+		window.emplace_back();
+		Packet& pkt = window.back();
+		pkt.seq_no = next;
+		pkt.file_rem = file_size;
+		pkt.t = time;
+		memcpy(pkt.buffer, buffer, BUFFERSIZE);
+		pkt.chk_sum = checksum(reinterpret_cast<const unsigned char*>(&pkt), sizeof(Packet) - sizeof(unsigned int));
 
-		value->seq_no = next;
-		value->file_rem = file_size;
-		value->t = time;
-		memcpy(value->buffer, buffer, sizeof(buffer));
-		value->chk_sum = checksum((void*)value, sizeof(Packet)-sizeof(unsigned int));
-		
-		window[index] = (unsigned char*)value;
+		n = sendto(sockfd, reinterpret_cast<const void*>(&pkt), sizeof(Packet), 0, (const struct sockaddr*)&serv_addr, addrlen);
+		if(n < 0){
+			syserr("Can't send");
+		}
 
-		unsigned char* pkt_ar = reinterpret_cast<unsigned char*>(value);
-		unsigned char pkt_array[sizeof(Packet)];
-		memcpy(pkt_array, pkt_ar, sizeof(Packet));
-		
-		n = sendto(sockfd, pkt_array, sizeof(Packet), 0, (struct sockaddr*)&serv_addr, addrlen);
-		if(n < 0){ syserr("Can't send"); }
-
-		file_size = (file_size - amo_read < 0) ? file_size : file_size - amo_read;
+		file_size = (file_size - amount_read < 0) ? file_size : file_size - amount_read;
 		next++;
-		if(next >= WINDOWSIZE*(send_iter+1)){ send_iter++; }
+		if(next >= WINDOWSIZE * (send_iter+1)){
+			send_iter++;
+		}
 	}
 	
 	while(acked > 0){
 		// select will wait for an event (event: (var > 0) incoming pkt, (var == 0) timeout, (var < 0) err)
 		sel_result = select(sockfd+1, &set, 0, 0, &timeout);
 		
-		if (sel_result < 0){ return -1; }
-		else if (sel_result > 0) {
+		if (sel_result < 0){
+			return -1;
+		}
+		else if (sel_result > 0){
+			// received a pkt
 			if(FD_ISSET(sockfd, &set)){
-				// receive a pkt
-				
 				int index = base - (WINDOWSIZE * recv_iter);
 				
 				timeval t_recv;
-				Packet *p_r, *p_s = reinterpret_cast<Packet*>(window[index]);
-				unsigned char pkt_array[sizeof(Packet)];
+				Packet p_r;
+				const Packet &p_s = window[index];
 				
-				n = recvfrom(sockfd, pkt_array, sizeof(Packet), 0, (struct sockaddr*)&serv_addr, &addrlen);
-			  	if(n < 0){ syserr("Can't receive"); }
-				
-				p_r = reinterpret_cast<Packet*>(pkt_array);
+				n = recvfrom(sockfd, reinterpret_cast<void*>(&p_r), sizeof(Packet), 0, (struct sockaddr*)&serv_addr, &addrlen);
+			  	if(n < 0){
+					syserr("Can't receive");
+				}
 			  	
 			  	// seq_no is correct and chk_sum needs to be correct to enter
-			  	if(p_r->seq_no == p_s->seq_no){
-			  		if(p_r->chk_sum == p_s->chk_sum){
-			  			gettimeofday(&t_recv, 0);
-			  			
-			  			// used to get the throughput
-						rtt += ((double)t_recv.tv_sec + (double)t_recv.tv_usec/1000000.0) - ((double)p_s->t.tv_sec + (double)p_s->t.tv_usec/1000000.0);
-			  			base++;
-			  			if(base >= WINDOWSIZE*(recv_iter+1)){ recv_iter++; }
-			  			
-			  			acked--;
-			  			amo_recv++;
-			  			
-			  			// when amount received is 100 we received all packets in the window
-			  			// now we need to send the next batch/portion/remainder of the file
-			  			if(amo_recv >= WINDOWSIZE){
-			  				// reset the time sense we received everything
-			  				timeout.tv_usec = 10000;
-			  				temp = (acked > 100) ? 100 : acked;
-			  				memset(window, 0, temp * sizeof(Packet));
-				  			for(int send = 0; send < temp; send++){
-					  			
-					  			int index = next - (WINDOWSIZE * send_iter);
-								timeval time;
-								
-								memset(buffer, 0, sizeof(buffer));
-								int amo_read = fread(buffer, sizeof(unsigned char), sizeof(buffer)-1, fp);
-								buffer[amo_read] = '\0';
-								gettimeofday(&time, 0);
-		
-								Packet *value = (Packet*)malloc(sizeof(Packet));
+			  	if(p_r.seq_no == p_s.seq_no && p_r.chk_sum == p_s.chk_sum){
+					gettimeofday(&t_recv, 0);
+					
+					// used to get the throughput
+					rtt += ((double)t_recv.tv_sec + (double)t_recv.tv_usec/1000000.0) - ((double)p_s.t.tv_sec + (double)p_s.t.tv_usec/1000000.0);
+					base++;
+					if(base >= WINDOWSIZE * (recv_iter+1)){
+						recv_iter++;
+					}
+					
+					acked--;
+					amount_recv++;
+					
+					// when amount received is 100 we received all packets in the window
+					// now we need to send the next batch/portion/remainder of the file
+					if(amount_recv >= WINDOWSIZE){
+						// reset the time since we received everything
+						timeout.tv_usec = 10000;
+						temp = (acked > 100) ? 100 : acked;
+						memset(reinterpret_cast<unsigned char*>(window.data()), 0, temp * sizeof(Packet));
+						for(int send = 0; send < temp; send++){
+							int index = next - (WINDOWSIZE * send_iter);
+							timeval time;
+							
+							memset(buffer, 0, BUFFERSIZE);
+							int amount_read = fread(buffer, sizeof(unsigned char), BUFFERSIZE, fp);
+							gettimeofday(&time, 0);
+	
+							Packet &value = window[index];
+							value.seq_no = next;
+							value.file_rem = file_size;
+							value.t = time;
+							memcpy(value.buffer, buffer, BUFFERSIZE);
+							value.chk_sum = checksum(reinterpret_cast<const unsigned char*>(&value), sizeof(Packet) - sizeof(unsigned int));
 
-								value->seq_no = next;
-								value->file_rem = file_size;
-								value->t = time;
-								memcpy(value->buffer, buffer, sizeof(buffer));
-								value->chk_sum = checksum((void*)value, sizeof(Packet)-sizeof(unsigned int));
-		
-								window[index] = (unsigned char*)value;
-
-								unsigned char* pkt_ar = reinterpret_cast<unsigned char*>(value);
-								unsigned char pkt_array[sizeof(Packet)];
-								memcpy(pkt_array, pkt_ar, sizeof(Packet));
-		
-								n = sendto(sockfd, pkt_array, sizeof(Packet), 0, (struct sockaddr*)&serv_addr, addrlen);
-								if(n < 0){ syserr("Can't send"); }
-
-								file_size = (file_size - amo_read < 0) ? file_size : file_size - amo_read;
-								next++;
-								if(next >= WINDOWSIZE*(send_iter+1)){ send_iter++; }
-								
+							n = sendto(sockfd, reinterpret_cast<const void*>(&value), sizeof(Packet), 0, (const struct sockaddr*)&serv_addr, addrlen);
+							if(n < 0){
+								syserr("Can't send");
 							}
-							amo_recv = 0;
-						}// end if amo_recv
-			  		}// end if chk_sum
-			  	}// end if seq_no
+
+							file_size = (file_size - amount_read < 0) ? file_size : file_size - amount_read;
+							next++;
+							if(next >= WINDOWSIZE * (send_iter+1)){
+								send_iter++;
+							}
+						}
+						amount_recv = 0;
+					}// end if amount_recv
+			  	}// end if seq_no && chk_sum
 			}
 		}
 		else{
 			//	time out
 			timeout.tv_usec = 10000;
 			int index, temp_iter = recv_iter;
-			Packet *p;
 			
 			for(int i = base; i < next; i++){
 				index = i - (WINDOWSIZE * temp_iter);
-				if(i >= WINDOWSIZE*(temp_iter+1)){ temp_iter++; }
+				if(i >= WINDOWSIZE*(temp_iter+1)){
+					temp_iter++;
+				}
 				
-				unsigned char pkt_array[sizeof(Packet)];
-				memcpy(pkt_array, window[index], sizeof(Packet));
-				
-				n = sendto(sockfd, pkt_array, sizeof(Packet), 0, (struct sockaddr*)&serv_addr, addrlen);
-				if(n < 0) syserr("Can't send");
+				n = sendto(sockfd, reinterpret_cast<const void*>(&window[index]), sizeof(Packet), 0, (const struct sockaddr*)&serv_addr, addrlen);
+				if(n < 0){
+					syserr("Can't send");
+				}
 			}
-			
 		}
-		FD_ZERO(&set);				// reset flags
+		// reset flags
+		FD_ZERO(&set);
 		FD_SET(sockfd, &set);
 	}
 	
@@ -215,7 +205,6 @@ int sender(char *recv_ip, int recv_port, char* file_name){
 	printf("***** Closing Connection *****\n");
 	fclose(fp);
 	close(sockfd);
-	free(window);
 	return 0;
 }
 
@@ -225,7 +214,7 @@ int receiver(unsigned int portno, char* file_name){
 	printf("Writting File: %s\n", file_name);
 	
 	/* Prepare File + Keep Recv alive for final pkts */
-	int file_size = 1, write_size = 0, done = 0, diff = 0, sel_result, amo_wrote, totalSize, isFirst = 1;
+	int file_size = 1, write_size = 0, done = 0, diff = 0, sel_result, amount_wrote, totalSize, isFirst = 1;
 		/* Keep Recv alive for final pkts */
 	timeval timeout;
 	fd_set set;
@@ -236,8 +225,7 @@ int receiver(unsigned int portno, char* file_name){
 	
 	/*Socket Prepare*/
 	int sockfd, n, seq_no_expect = 0;
-	unsigned char pkt_array[sizeof(Packet)];
-	Packet *p;
+	Packet pkt;
 	struct sockaddr_in addr_self, addr_recv;
 	socklen_t addrlen;	
 	
@@ -250,39 +238,43 @@ int receiver(unsigned int portno, char* file_name){
 	addr_self.sin_port = htons(portno);
 	addrlen = sizeof(addr_recv);
 	
-	if(bind(sockfd, (struct sockaddr*)&addr_self, sizeof(addr_self)) < 0){ syserr("Can't Bind"); }
+	if(bind(sockfd, (struct sockaddr*)&addr_self, sizeof(addr_self)) < 0){
+		syserr("Can't Bind");
+	}
 	/*Socket Prepare*/
 	
 	do{
-		n = recvfrom(sockfd, pkt_array, sizeof(Packet), 0, (struct sockaddr*)&addr_recv, &addrlen);
+		n = recvfrom(sockfd, reinterpret_cast<void*>(&pkt), sizeof(Packet), 0, (struct sockaddr*)&addr_recv, &addrlen);
 		if(n < 0){ syserr("Can't receive from client"); }
 		
-		p = reinterpret_cast<Packet*>(pkt_array);
-		
 		// Seq_no are received inorder or pkt that were lost when heading to the sender
-		if(seq_no_expect >= p->seq_no){
-			// Omit the chksum when adding
-			if( p->chk_sum && ~checksum(pkt_array, sizeof(Packet)-sizeof(unsigned int)) ){
-				if(seq_no_expect == p->seq_no){
-					seq_no_expect++;
-					
-					file_size = p->file_rem;
-					write_size = (file_size - 1024 <= 0) ? file_size : 1024;
-					
-					amo_wrote = fwrite(p->buffer, sizeof(unsigned char), write_size, fp);
-					if(isFirst){ totalSize = file_size; isFirst = 0;}
-					file_size -= amo_wrote;
-				}
+		if(seq_no_expect >= pkt.seq_no && pkt.chk_sum && 
+		   ~checksum(reinterpret_cast<const unsigned char*>(&pkt), sizeof(Packet) - sizeof(unsigned int)) ){
+			
+			if(seq_no_expect == pkt.seq_no){
+				seq_no_expect++;
 				
-				if(seq_no_expect > p->seq_no){ diff = seq_no_expect - p->seq_no; }
-				n = sendto(sockfd, pkt_array, sizeof(Packet), 0, (struct sockaddr*)&addr_recv, addrlen);
-				if(n < 0){ syserr("Can't send"); }
+				file_size = pkt.file_rem;
+				write_size = (file_size - BUFFERSIZE <= 0) ? file_size : BUFFERSIZE;
+				
+				amount_wrote = fwrite(pkt.buffer, sizeof(unsigned char), write_size, fp);
+				if(isFirst){ totalSize = file_size; isFirst = 0; }
+				file_size -= amount_wrote;
+			}
+			if(seq_no_expect > pkt.seq_no){
+				diff = seq_no_expect - pkt.seq_no;
+			}
+			
+			n = sendto(sockfd, reinterpret_cast<const void*>(&pkt), sizeof(Packet), 0, (const struct sockaddr*)&addr_recv, addrlen);
+			if(n < 0){
+				syserr("Can't send");
 			}
 		}
 		
 		// When file size == 0 make receiver wait 1 sec to see if we have pkt that were lost in transit
 		if(file_size == 0 && diff <= 1){
-			FD_ZERO(&set);				// reset flags
+			// reset flags
+			FD_ZERO(&set);
 			FD_SET(sockfd, &set);
 			timeout.tv_sec = 1; timeout.tv_usec = 0;
 			sel_result = select(sockfd+1, &set, 0, 0, &timeout);
@@ -290,7 +282,6 @@ int receiver(unsigned int portno, char* file_name){
 			if (sel_result < 0){ return -1; }
 			else if (sel_result == 0) { done = 1; }
 		}
-		
 	}while(!done);
 	
 	printf("Transfer Size: %.2f Kb\nCompleted\n", (double)totalSize/1024);
@@ -299,6 +290,3 @@ int receiver(unsigned int portno, char* file_name){
 	fclose(fp);
 	return 0;
 }
-
-
-
